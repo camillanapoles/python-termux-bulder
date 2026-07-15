@@ -1,0 +1,321 @@
+name: Termux Wheel Factory
+
+# Workflow PARALELO e AGNÓSTICO ao `android-wheel.yml` (mantido como referência).
+# Nenhum nome de família de pacote é hardcoded dentro do pipeline principal.
+# Casos de sdist-incompleto são tratados por overrides por-arquivo em
+# .github/overrides/<sanitizado>.sh  (lookup exato -> prefixo).
+#
+# Entrada : (package_name, package_version?, python_version, arch?)
+# Saída   : artefato "{package_name}-android-{arch}" contendo *.whl
+#           (tags linux_<arch> retagados p/ android_<api>_<abi> para o Termux).
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Nome do módulo no PyPI (ex: jiter, pydantic-core, orjson, rapidfuzz...)'
+        required: true
+        type: string
+      package_version:
+        description: 'Versão (VAZIO = mais recente do PyPI)'
+        required: false
+        default: ''
+        type: string
+      python_version:
+        description: 'Versão do Python no Termux (ex: 3.12)'
+        required: true
+        default: '3.12'
+        type: string
+      arch:
+        description: 'Arquitetura alvo (aarch64, x86_64, armv7l, i686)'
+        required: false
+        default: 'aarch64'
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: termux-wheel-${{ github.ref }}-${{ inputs.package_name }}-${{ inputs.arch }}-${{ inputs.python_version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_API: 24
+      ARCH: ${{ inputs.arch }}
+      # Mapeamento arch -> LLVM triple (Lei 4 do SEQUENCIADOR). Sem hardcode de pacote.
+      TARGET: ${{ inputs.arch == 'aarch64' && 'aarch64-linux-android'
+                || inputs.arch == 'x86_64'  && 'x86_64-linux-android'
+                || inputs.arch == 'armv7l'  && 'armv7a-linux-androideabi'
+                || inputs.arch == 'i686'    && 'i686-linux-android'
+                || 'aarch64-linux-android' }}
+      # ABI Termux p/ retag final (plataforma android_<api>_<abi> que o pip do Termux aceita).
+      ABI: ${{ inputs.arch == 'aarch64' && 'arm64_v8a'
+            || inputs.arch == 'x86_64'  && 'x86_64'
+            || inputs.arch == 'armv7l'  && 'armeabi_v7a'
+            || inputs.arch == 'i686'    && 'x86'
+            || 'arm64_v8a' }}
+      SYSROOT_DIR: ${{ github.workspace }}/.cache/android-sysroot
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔎 Validar inputs
+        run: |
+          set -e
+          case "${{ env.ARCH }}" in
+            aarch64|x86_64|armv7l|i686) ;;
+            *) echo "❌ arch inválido: ${{ env.ARCH }}"; exit 1 ;;
+          esac
+          case "${{ inputs.python_version }}" in
+            3.*) ;;
+            *) echo "❌ python_version deve ser 3.x (ex: 3.12)"; exit 1 ;;
+          esac
+          [ -n "${{ inputs.package_name }}" ] || { echo "❌ package_name vazio"; exit 1; }
+          echo "✅ inputs válidos: pkg=${{ inputs.package_name }} ver='${{ inputs.package_version }}' py=${{ inputs.python_version }} arch=${{ env.ARCH }}"
+
+      - name: 🐍 Setup Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: 📱 Setup Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: ⚡ Cache Rust toolchain (package-agnóstico)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.rustup/
+          key: rust-${{ env.TARGET }}-py${{ inputs.python_version }}
+          restore-keys: |
+            rust-${{ env.TARGET }}-
+            rust-
+
+      - name: 🦀 Setup Rust + PyO3 env (Lei 2: PYO3_NO_PYTHON_LINKING)
+        run: |
+          set -e
+          rustup target add ${{ env.TARGET }}
+          pip install --upgrade pip maturin
+          echo "PYO3_PYTHON=$(which python3)"            >> "$GITHUB_ENV"
+          echo "PYO3_NO_PYTHON_LINKING=1"                >> "$GITHUB_ENV"
+          NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          case "${{ env.ARCH }}" in
+            aarch64) LLVM="aarch64-linux-android";          CTRIP="AARCH64_LINUX_ANDROID" ;;
+            x86_64)  LLVM="x86_64-linux-android";           CTRIP="X86_64_LINUX_ANDROID"  ;;
+            armv7l)  LLVM="armv7a-linux-androideabi";       CTRIP="ARMV7A_LINUX_ANDROIDEABI" ;;
+            i686)    LLVM="i686-linux-android";             CTRIP="I686_LINUX_ANDROID"    ;;
+            *) echo "❌ arch não suportada: ${{ env.ARCH }}"; exit 1 ;;
+          esac
+          echo "LLVM_TRIPLE=$LLVM" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${CTRIP}_LINKER=${NDK_BIN}/${LLVM}${{ env.ANDROID_API }}-clang" >> "$GITHUB_ENV"
+          echo "CC_${LLVM//-/_}=${NDK_BIN}/${LLVM}${{ env.ANDROID_API }}-clang"  >> "$GITHUB_ENV"
+          echo "CXX_${LLVM//-/_}=${NDK_BIN}/${LLVM}${{ env.ANDROID_API }}-clang++" >> "$GITHUB_ENV"
+
+      - name: 📚 Fake libpython para o linker (Lei 3: fake library)
+        run: |
+          set -e
+          PYV=$(python3 -c "import sys;print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+          mkdir -p fake_libs
+          : > fake_libs/libpython${PYV}.so
+          echo "RUSTFLAGS=-L ${{ github.workspace }}/fake_libs -C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,--allow-shlib-undefined" >> "$GITHUB_ENV"
+          echo "CXXFLAGS_FWD=-L${{ github.workspace }}/fake_libs" >> "$GITHUB_ENV"
+          echo "LDFLAGS_FWD=-L${{ github.workspace }}/fake_libs -Wl,--unresolved-symbols=ignore-all -Wl,--allow-shlib-undefined" >> "$GITHUB_ENV"
+
+      - name: 📦 Cache Android Python Sysroot (Layer 2)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SYSROOT_DIR }}
+          key: sysroot-${{ inputs.arch }}-py${{ inputs.python_version }}
+
+      - name: 🐍 Preparar sysroot Python Android (agnóstico, sem literais)
+        run: |
+          ./.github/scripts/prepare-termux-python.sh \
+            "${{ env.ARCH }}" \
+            "${{ env.ANDROID_API }}" \
+            "${{ inputs.python_version }}"
+
+      - name: 🧩 Verificar patch por-pacote (agnóstico)
+        id: patch
+        run: |
+          set -e
+          PKG="${{ inputs.package_name }}"
+          # Sanitiza: lowercase, não-alfanum -> '-'
+          SANITIZED=$(printf '%s' "$PKG" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')
+          PREFIX=$(printf '%s' "$SANITIZED" | cut -d- -f1)
+          PAT=""
+          for cand in "$SANITIZED" "$PREFIX"; do
+            f="patches/${cand}.sh"
+            if [ -f "$f" ]; then PAT="$f"; break; fi
+          done
+          if [ -n "$PAT" ]; then
+            echo "📜 Patch encontrado: $PAT"
+          else
+            echo "📜 Nenhum patch (build puramente default)"
+          fi
+          echo "patch_path=$PAT"        >> "$GITHUB_OUTPUT"
+          echo "pkg_sanitized=$SANITIZED"  >> "$GITHUB_OUTPUT"
+
+      - name: 🏗️ Download + Patch + Build (agnóstico)
+        env:
+          PKG: ${{ inputs.package_name }}
+          VER: ${{ inputs.package_version }}
+          ARCH: ${{ env.ARCH }}
+          TARGET: ${{ env.TARGET }}
+          ANDROID_API: ${{ env.ANDROID_API }}
+          PYTHON_VERSION: ${{ inputs.python_version }}
+          WORKSPACE: ${{ github.workspace }}
+          PATCH_PATH: ${{ steps.patch.outputs.patch_path }}
+        run: |
+          set -e
+          mkdir -p build_area && cd build_area
+
+          # 1) Download sdist (default = latest). Não assume família.
+          if [ -z "$VER" ]; then
+            echo "📥 Versão vazia -> mais recente de $PKG"
+            pip download --no-binary :all: --no-deps "$PKG"
+          else
+            echo "📥 Baixando $PKG==$VER"
+            pip download --no-binary :all: --no-deps "$PKG==$VER"
+          fi
+
+          # 2) Extrai (suporta .tar.gz/.tar.bz2/.zip).
+          SRC=$(ls -1 *.tar.* *.zip 2>/dev/null | head -1)
+          [ -n "$SRC" ] || { echo "❌ sdist não encontrado"; exit 1; }
+          case "$SRC" in
+            *.tar.gz|*.tgz)  tar -xzf "$SRC" ;;
+            *.tar.bz2)        tar -xjf "$SRC" ;;
+            *.tar.xz)         tar -xJf "$SRC" ;;
+            *.zip)            unzip -q "$SRC" ;;
+            *) echo "❌ formato de sdist não suportado: $SRC"; exit 1 ;;
+          esac
+          PKG_DIR="$(find . -maxdepth 1 -type d | tail -n 1)"
+          export PKG_DIR="$(cd "$PKG_DIR" && pwd)"
+          echo "PKG_DIR=$PKG_DIR"
+          cd "$PKG_DIR"
+
+          # 3) Patch (apenas se existir). Pipeline principal NÃO conhece famílias.
+          if [ -n "$PATCH_PATH" ]; then
+            echo "📜 Executando patch: $PATCH_PATH"
+            # shellcheck source=/dev/null
+            bash "${{ github.workspace }}/$PATCH_PATH"
+          fi
+
+          # 4) Detecção de tipo (Lei: nunca por nome de pacote).
+          echo "🔍 Detectando tipo de projeto em: $PKG_DIR"
+          if [ -f Cargo.toml ]; then
+            echo "🦀 Projeto Rust -> maturin (Lei 5: --skip-auditwheel, Lei 6: --strip)"
+            if maturin build $MATURIN_BUILD_ARGS --out ../../dist; then
+              echo "✅ Build Rust OK"
+            else
+              echo "⚠️  Build Rust falhou -> fallback wheel manylinux (parametrizado por arch)"
+              cd ../..
+              MANY=$(case "$ARCH" in
+                      aarch64) echo "manylinux_2_34_aarch64 manylinux2014_aarch64 linux_aarch64" ;;
+                      x86_64)  echo "manylinux_2_34_x86_64 manylinux2014_x86_64 linux_x86_64" ;;
+                      armv7l)  echo "manylinux_2_17_armv7l manylinux2014_armv7l linux_armv7l" ;;
+                      i686)    echo "manylinux_2_17_i686 manylinux2014_i686 linux_i686" ;;
+                    esac)
+              for PLAT in $MANY; do
+                pip download --only-binary :all: --platform "$PLAT" --no-deps \
+                  -d dist "$PKG${VER:+==$VER}" 2>/dev/null && break || true
+              done || true
+              ls -1 dist/ 2>/dev/null || echo "⚠️  nenhum wheel alternativo"
+            fi
+
+          elif [ -f pyproject.toml ] || [ -f setup.py ]; then
+            echo "🐍 Projeto C/C++/Cython -> cross-compile NDK ($TARGET, API $ANDROID_API)"
+            pip install --upgrade pip build wheel setuptools cython >/dev/null
+            NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            PYV=$(python3 -c "import sys;print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+            export CC="${NDK_BIN}/${TARGET}${ANDROID_API}-clang"
+            export CXX="${NDK_BIN}/${TARGET}${ANDROID_API}-clang++"
+            export AR="${NDK_BIN}/llvm-ar"
+            export RANLIB="${NDK_BIN}/llvm-ranlib"
+            export STRIP="${NDK_BIN}/llvm-strip"
+            export LDSHARED="${CC} -shared"
+            # -include stdbool.h é praticamente inofensivo em qualquer projeto C e corrige
+            # parsers gerados que esquecem <stdbool.h>. Mantemos universal.
+            COMMON_C="--target=${TARGET}${ANDROID_API} -fPIC -include stdbool.h -L${{ github.workspace }}/fake_libs"
+            export CFLAGS="${COMMON_C}"
+            export CXXFLAGS="${COMMON_C}"
+            export LDFLAGS="--target=${TARGET}${ANDROID_API} -L${{ github.workspace }}/fake_libs -Wl,--unresolved-symbols=ignore-all -Wl,--allow-shlib-undefined"
+            # _PYTHON_HOST_PLATFORM força tag linux_<arch> (o wheel tooling do runner não conhece android).
+            case "$ARCH" in
+              aarch64) _PHP="linux-aarch64" ;;
+              x86_64)  _PHP="linux-x86_64" ;;
+              armv7l)  _PHP="linux-armv7l" ;;
+              i686)    _PHP="linux-i686" ;;
+            esac
+            export _PYTHON_HOST_PLATFORM="${_PHP}"
+            # Headers tree-sitter vendorizados APENAS se o projeto os referenciar.
+            # Heurística por CONTEÚDO, não por nome de pacote.
+            if grep -rqE "tree_sitter/(parser|alloc|array)\.h" --include='*.c' --include='*.h' . 2>/dev/null; then
+              LANG_VER=$(grep -rhoE "LANGUAGE_VERSION +[0-9]+" $(find . -name parser.c 2>/dev/null) 2>/dev/null | head -1 | grep -oE "[0-9]+$" || true)
+              if [ -n "$LANG_VER" ] && [ "$LANG_VER" -le 14 ]; then
+                TS_INC="${{ github.workspace }}/.github/vendor/tree_sitter_v14"
+                echo "   tree-sitter LANGUAGE_VERSION=$LANG_VER -> headers legados (v0.20.8)"
+              else
+                TS_INC="${{ github.workspace }}/.github/vendor/tree_sitter"
+                echo "   tree-sitter LANGUAGE_VERSION=$LANG_VER -> headers modernos"
+              fi
+              export CFLAGS="${CFLAGS} -I${TS_INC}"
+              export CXXFLAGS="${CXXFLAGS} -I${TS_INC}"
+            fi
+            if [ -f pyproject.toml ]; then
+              python -m build --wheel --outdir ../../dist
+            else
+              pip wheel . -w ../../dist --no-deps
+            fi
+
+          else
+            echo "❌ Tipo de projeto não reconhecido (sem Cargo.toml/pyproject.toml/setup.py)"
+            exit 1
+          fi
+
+      - name: 🏷️ Retag linux → android (para o pip do Termux)
+        run: |
+          set -e
+          NEWPLAT="android_${{ env.ANDROID_API }}_${{ env.ABI }}"
+          python3 .github/scripts/retag-wheel.py dist "$NEWPLAT"
+          echo "=== wheels finais (android) ==="
+          ls -1 dist/
+
+      - name: 📤 Upload artefato ${{ inputs.package_name }}-android-${{ env.ABI }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.package_name }}-android-${{ env.ABI }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 🧾 Resumo do run (para consumo do helper local)
+        if: always()
+        run: |
+          echo "## Termux Wheel — ${{ inputs.package_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Pacote**: \`${{ inputs.package_name }}\` \`${{ inputs.package_version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Python**: \`${{ inputs.python_version }}\`  **Arch**: \`${{ env.ARCH }}\` (\`${{ env.ABI }}\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Artefato**: \`${{ inputs.package_name }}-android-${{ env.ABI }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if ls dist/*.whl >/dev/null 2>&1; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            ls -1 dist/*.whl | sed 's#.*/##' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "> ⚠️ Nenhum wheel gerado (verifique logs acima)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "No Termux, instale com:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+          echo "pip install ${{ inputs.package_name }}-*-android_${{ env.ANDROID_API }}_${{ env.ABI }}/*.whl" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
