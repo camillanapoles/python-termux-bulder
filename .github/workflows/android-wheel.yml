@@ -199,11 +199,11 @@ jobs:
             export CXXFLAGS="--target=${{ env.TARGET }}${{ env.ANDROID_API }} -fPIC -include stdbool.h -L${{ github.workspace }}/fake_libs"
             export LDFLAGS="--target=${{ env.TARGET }}${{ env.ANDROID_API }} -L${{ github.workspace }}/fake_libs -Wl,--unresolved-symbols=ignore-all -Wl,--allow-shlib-undefined"
             case "${{ env.ARCH }}" in
-              # Tag android_<api>_<abi>: bate com o python DEFAULT do Termux (3.14+ reporta android-<api>-<abi>), onde existe numpy via pkg. Para Termux python antigo (linux-aarch64), troque por linux-<arch>.
-              aarch64) _HOST_PLATFORM="android-${{ env.ANDROID_API }}-arm64_v8a" ;;
-              x86_64)  _HOST_PLATFORM="android-${{ env.ANDROID_API }}-x86_64" ;;
-              armv7l)  _HOST_PLATFORM="android-${{ env.ANDROID_API }}-armeabi_v7a" ;;
-              i686)    _HOST_PLATFORM="android-${{ env.ANDROID_API }}-x86" ;;
+              aarch64) _HOST_PLATFORM="linux-aarch64" ;;
+              x86_64)  _HOST_PLATFORM="linux-x86_64" ;;
+              armv7l)  _HOST_PLATFORM="linux-armv7l" ;;
+              i686)    _HOST_PLATFORM="linux-i686" ;;
+              # Nota: retag linux->android acontece no step seguinte (wheel tooling do runner nao conhece plataforma android)
             esac
             export _PYTHON_HOST_PLATFORM="${_HOST_PLATFORM}"
             pip install --upgrade pip build wheel setuptools cython
@@ -230,6 +230,17 @@ jobs:
             echo "❌ Tipo de projeto não reconhecido (sem Cargo.toml, pyproject.toml ou setup.py)"
             exit 1
           fi
+
+      - name: 🏷️ Retag wheels (linux → android) para o Termux
+        run: |
+          case "${{ inputs.arch }}" in
+            aarch64) ABI="arm64_v8a" ;;
+            x86_64)  ABI="x86_64" ;;
+            armv7l)  ABI="armeabi_v7a" ;;
+            i686)    ABI="x86" ;;
+          esac
+          python3 .github/scripts/retag-wheel.py dist "android_${{ env.ANDROID_API }}_${ABI}"
+          echo "=== wheels finais ==="; ls -1 dist/
 
       - name: 📤 Upload Wheel Artifact
         uses: actions/upload-artifact@v4
