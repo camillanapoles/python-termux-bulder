@@ -171,8 +171,8 @@ jobs:
             export RANLIB="${NDK_BIN}/llvm-ranlib"
             export STRIP="${NDK_BIN}/llvm-strip"
             export LDSHARED="${CC} -shared"
-            export CFLAGS="--target=${{ env.TARGET }}${{ env.ANDROID_API }} -fPIC -include stdbool.h -L${{ github.workspace }}/fake_libs"
-            export CXXFLAGS="--target=${{ env.TARGET }}${{ env.ANDROID_API }} -fPIC -include stdbool.h -L${{ github.workspace }}/fake_libs"
+            export CFLAGS="--target=${{ env.TARGET }}${{ env.ANDROID_API }} -fPIC -include stdbool.h -I${{ github.workspace }}/.github/vendor -L${{ github.workspace }}/fake_libs"
+            export CXXFLAGS="--target=${{ env.TARGET }}${{ env.ANDROID_API }} -fPIC -include stdbool.h -I${{ github.workspace }}/.github/vendor -L${{ github.workspace }}/fake_libs"
             export LDFLAGS="--target=${{ env.TARGET }}${{ env.ANDROID_API }} -L${{ github.workspace }}/fake_libs -Wl,--unresolved-symbols=ignore-all -Wl,--allow-shlib-undefined"
             case "${{ env.ARCH }}" in
               aarch64) _HOST_PLATFORM="linux-aarch64" ;;
