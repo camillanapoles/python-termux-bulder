@@ -161,15 +161,33 @@ jobs:
               ls dist/ 2>/dev/null || echo "⚠️ Nenhuma wheel alternativa encontrada"
             fi
             
-          elif [ -f "pyproject.toml" ]; then
-            echo "🐍 Projeto Python moderno detectado (pyproject.toml) → usando python -m build"
-            pip install build
-            python -m build --wheel --outdir ../../dist
-            
-          elif [ -f "setup.py" ]; then
-            echo "🐍 Projeto Python legado detectado (setup.py) → usando pip wheel"
-            pip wheel . -w ../../dist --no-deps
-            
+          elif [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+            echo "🐍 Projeto C/C++/Cython detectado → cross-compilando extensão nativa para ${{ env.TARGET }}"
+            # Cross-compile env: setuptools/distutils alvo Android (mesma estratégia fake-lib do Rust)
+            NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            export CC="${NDK_BIN}/${{ env.TARGET }}${{ env.ANDROID_API }}-clang"
+            export CXX="${NDK_BIN}/${{ env.TARGET }}${{ env.ANDROID_API }}-clang++"
+            export AR="${NDK_BIN}/llvm-ar"
+            export RANLIB="${NDK_BIN}/llvm-ranlib"
+            export STRIP="${NDK_BIN}/llvm-strip"
+            export LDSHARED="${CC} -shared"
+            export CFLAGS="--target=${{ env.TARGET }}${{ env.ANDROID_API }} -fPIC -L${{ github.workspace }}/fake_libs"
+            export CXXFLAGS="--target=${{ env.TARGET }}${{ env.ANDROID_API }} -fPIC -L${{ github.workspace }}/fake_libs"
+            export LDFLAGS="--target=${{ env.TARGET }}${{ env.ANDROID_API }} -L${{ github.workspace }}/fake_libs -Wl,--unresolved-symbols=ignore-all -Wl,--allow-shlib-undefined"
+            case "${{ env.ARCH }}" in
+              aarch64) _HOST_PLATFORM="linux-aarch64" ;;
+              x86_64)  _HOST_PLATFORM="linux-x86_64" ;;
+              armv7l)  _HOST_PLATFORM="linux-armv7l" ;;
+              i686)    _HOST_PLATFORM="linux-i686" ;;
+            esac
+            export _PYTHON_HOST_PLATFORM="${_HOST_PLATFORM}"
+            pip install --upgrade pip build wheel setuptools cython
+            if [ -f "pyproject.toml" ]; then
+              python -m build --wheel --outdir ../../dist
+            else
+              pip wheel . -w ../../dist --no-deps
+            fi
+
           else
             echo "❌ Tipo de projeto não reconhecido (sem Cargo.toml, pyproject.toml ou setup.py)"
             exit 1
