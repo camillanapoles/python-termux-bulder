@@ -1,0 +1,32 @@
+# --- LÓGICA DE SEPARAÇÃO DE MUNDOS ---
+
+if [ ! -d "/usr/bin" ]; then
+    # [ESTADO: ANDROID] 
+    # Não carregue nada! Apenas peça para entrar no Linux.
+    export REQUEST_CHROOT_ENTER=1
+else
+    # [ESTADO: LINUX]
+    # Agora sim, carregue as ferramentas pesadas.
+    
+    # 1. Identidade
+    PROJECT_NAME=$(basename "$PWD")
+    export AICHAT_SESSION_NAME="ai-${PROJECT_NAME}"
+
+    # 2. Python UV (Caminhos Linux)
+    VENV_DIR="$HOME/.venvs/${PROJECT_NAME}"
+    
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "⚡ Criando venv UV isolado..."
+        mkdir -p "$HOME/.venvs"
+        uv venv --system-site-packages "$VENV_DIR"
+    fi
+    
+    if [ -f "$VENV_DIR/bin/activate" ]; then
+        source "$VENV_DIR/bin/activate"
+    fi
+
+    # 3. Rust
+    if command -v rustc >/dev/null; then
+        export RUSTFLAGS="-C linker=clang"
+    fi
+fi

@@ -1,0 +1,135 @@
+name: Android Wheel Factory (Test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Nome do Pacote (ex: jiter)'
+        required: true
+        default: 'jiter'
+      package_version:
+        description: 'Versão (ex: 0.12.0)'
+        required: true
+        default: '0.12.0'
+      python_version:
+        description: 'Versão Python (ex: 3.12)'
+        required: true
+        default: '3.12'
+
+jobs:
+  build:
+    name: 🏗️ Build ${{ inputs.package_name }} v${{ inputs.package_version }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    env:
+      ANDROID_API: 24
+      TARGET: aarch64-linux-android
+      PYO3_NO_PYTHON_LINKING: 1
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: ⚡ Cache Rust Toolchain & Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.rustup/
+            target/
+          key: ${{ runner.os }}-rust-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-${{ env.TARGET }}-
+            ${{ runner.os }}-rust-
+
+      - name: 🦀 Setup Rust & Android NDK
+        run: |
+          set -e
+          
+          echo "📦 Installing Rust target for Android ARM64..."
+          rustup target add ${{ env.TARGET }}
+          
+          echo "🔧 Installing Maturin build tool..."
+          pip install --upgrade pip
+          pip install maturin
+          
+          # Configura variáveis de ambiente para o NDK (linker e compilador C/C++)
+          NDK_TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          echo "CC_aarch64_linux_android=$NDK_TOOLCHAIN/aarch64-linux-android${{ env.ANDROID_API }}-clang" >> $GITHUB_ENV
+          echo "CXX_aarch64_linux_android=$NDK_TOOLCHAIN/aarch64-linux-android${{ env.ANDROID_API }}-clang++" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_TOOLCHAIN/aarch64-linux-android${{ env.ANDROID_API }}-clang" >> $GITHUB_ENV
+          
+          # ESTRATÉGIA: Criar biblioteca Python falsa para enganar o linker
+          # O linker procura por libpython3.XX.so mas não está disponível para Android ARM64
+          # Criamos um arquivo vazio (stub) e configuramos flags para ignorar símbolos não resolvidos
+          # Os símbolos serão resolvidos em runtime pelo Python do Termux
+          echo "🎭 Creating fake libpython to trick the linker..."
+          mkdir -p ${{ github.workspace }}/fake_libs
+          touch ${{ github.workspace }}/fake_libs/libpython${{ inputs.python_version }}.so
+          
+          # Configura RUSTFLAGS para usar a biblioteca falsa e ignorar símbolos não resolvidos
+          # -L: Adiciona o diretório de busca de bibliotecas
+          # -C link-arg=-Wl,--unresolved-symbols=ignore-all: Ignora símbolos não resolvidos
+          # -C link-arg=-Wl,--allow-shlib-undefined: Permite undefined symbols em shared libraries
+          RUSTFLAGS_VALUE="-L ${{ github.workspace }}/fake_libs -C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,--allow-shlib-undefined"
+          echo "RUSTFLAGS=$RUSTFLAGS_VALUE" >> $GITHUB_ENV
+          
+          echo "✅ Environment configured successfully"
+
+      - name: 🏗️ Download & Build Wheel
+        run: |
+          set -e
+          
+          echo "🤖 Iniciando build para: ${{ inputs.package_name }} v${{ inputs.package_version }}"
+          
+          # Cria diretório de trabalho limpo
+          mkdir -p build_area
+          cd build_area
+          
+          # Baixa apenas o código-fonte (sdist), sem binários pré-compilados
+          echo "📥 Downloading source distribution..."
+          pip download --no-binary :all: --no-deps ${{ inputs.package_name }}==${{ inputs.package_version }}
+          
+          # Extrai o tarball
+          echo "📦 Extracting source code..."
+          tar -xzf *.tar.gz --one-top-level=src_code --strip-components=1
+          cd src_code
+          
+          # Compila o wheel usando Maturin com cross-compilation para Android
+          echo "🚀 Building wheel for Android ARM64 (aarch64)..."
+          echo "   Target: ${{ env.TARGET }}"
+          echo "   Python: ${{ inputs.python_version }}"
+          echo "   PYO3_NO_PYTHON_LINKING: ${{ env.PYO3_NO_PYTHON_LINKING }}"
+          
+          maturin build \
+            --release \
+            --target ${{ env.TARGET }} \
+            --out ../../dist \
+            --interpreter python${{ inputs.python_version }} \
+            --skip-auditwheel \
+            --strip
+          
+          echo "✅ Build completed successfully!"
+
+      - name: 📊 Display Build Artifacts
+        run: |
+          echo "📦 Generated wheel files:"
+          ls -lh dist/*.whl || echo "⚠️  No wheel files found"
+
+      - name: 📤 Upload Wheel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.package_name }}-${{ inputs.package_version }}-android-aarch64
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6

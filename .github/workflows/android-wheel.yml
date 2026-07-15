@@ -1,0 +1,177 @@
+name: Android Wheel Factory
+
+on:
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: 'Versão Python (ex: 3.12)'
+        required: true
+        default: '3.12'
+      package_name:
+        description: 'Nome do Pacote (ex: jiter)'
+        required: true
+      package_version:
+        description: 'Versão (DEIXE EM BRANCO para a mais recente)'
+        required: false
+        default: ''
+      arch:
+        description: 'Arquitetura alvo (aarch64, x86_64, armv7l, i686)'
+        required: false
+        default: 'aarch64'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    env:
+      ANDROID_API: 24
+      ARCH: ${{ inputs.arch }}
+      TARGET: ${{ inputs.arch == 'aarch64' && 'aarch64-linux-android' || inputs.arch == 'x86_64' && 'x86_64-linux-android' || inputs.arch == 'armv7l' && 'armv7a-linux-androideabi' || inputs.arch == 'i686' && 'i686-linux-android' || 'aarch64-linux-android' }}
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: ''
+
+      - name: 📱 Setup Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: ⚡ Cache Rust Toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.rustup/
+            target/
+          key: ${{ runner.os }}-rust-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-${{ env.TARGET }}-
+            ${{ runner.os }}-rust-
+
+      - name: 🦀 Setup Rust & PyO3 Env
+        run: |
+          set -e
+          rustup target add ${{ env.TARGET }}
+          pip install --upgrade pip maturin
+          
+          echo "PYO3_PYTHON=$(which python3)" >> $GITHUB_ENV
+          echo "PYO3_NO_PYTHON_LINKING=1" >> $GITHUB_ENV
+          
+          NDK_TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          
+          # Mapear arquitetura para prefixo do linker
+          case "${{ env.ARCH }}" in
+            aarch64)
+              LLVM_TRIPLE="aarch64-linux-android"
+              CARGO_TRIPLE="AARCH64_LINUX_ANDROID"
+              ;;
+            x86_64)
+              LLVM_TRIPLE="x86_64-linux-android"
+              CARGO_TRIPLE="X86_64_LINUX_ANDROID"
+              ;;
+            armv7l)
+              LLVM_TRIPLE="armv7a-linux-androideabi"
+              CARGO_TRIPLE="ARMV7A_LINUX_ANDROIDEABI"
+              ;;
+            i686)
+              LLVM_TRIPLE="i686-linux-android"
+              CARGO_TRIPLE="I686_LINUX_ANDROID"
+              ;;
+            *)
+              echo "❌ Arquitetura não suportada: ${{ env.ARCH }}"
+              exit 1
+              ;;
+          esac
+          
+          echo "CARGO_TARGET_${CARGO_TRIPLE}_LINKER=$NDK_TOOLCHAIN/${LLVM_TRIPLE}${{ env.ANDROID_API }}-clang" >> $GITHUB_ENV
+          echo "CC_${LLVM_TRIPLE//-/_}=$NDK_TOOLCHAIN/${LLVM_TRIPLE}${{ env.ANDROID_API }}-clang" >> $GITHUB_ENV
+          echo "CXX_${LLVM_TRIPLE//-/_}=$NDK_TOOLCHAIN/${LLVM_TRIPLE}${{ env.ANDROID_API }}-clang++" >> $GITHUB_ENV
+
+      - name: 📚 Create Fake libpython for Linker
+        run: |
+          set -e
+          PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+          mkdir -p fake_libs
+          touch fake_libs/libpython${PYTHON_VER}.so
+          echo "RUSTFLAGS=-L ${{ github.workspace }}/fake_libs -C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,--allow-shlib-undefined" >> $GITHUB_ENV
+
+      - name: 🐍 Prepare Android Python Sysroot (para maturin/PyO3)
+        run: |
+          ./.github/scripts/prepare-android-python.sh \
+            "${{ env.ARCH }}" \
+            "${{ env.ANDROID_API }}" \
+            "${{ inputs.python_version }}"
+
+      - name: 🏗️ Download & Build Wheel
+        run: |
+          set -e
+          mkdir -p build_area && cd build_area
+          
+          PKG="${{ inputs.package_name }}"
+          VER="${{ inputs.package_version }}"
+          
+          # LÓGICA DE DEFAULT PYTHONICA
+          if [ -z "$VER" ]; then
+            echo "📥 Versão não especificada. Baixando a versão mais recente de $PKG..."
+            pip download --no-binary :all: --no-deps "$PKG"
+          else
+            echo "📥 Baixando $PKG na versão exata $VER..."
+            pip download --no-binary :all: --no-deps "$PKG==$VER"
+          fi
+          
+          tar -xzf *.tar.gz
+          cd $(find . -maxdepth 1 -type d | tail -n 1)
+          
+          echo "🔍 Detectando tipo de projeto..."
+          
+          # DETECTA TIPO DE PROJETO E USA FERRAMENTA APROPRIADA
+          if [ -f "Cargo.toml" ]; then
+            echo "🦀 Projeto Rust detectado (Cargo.toml) → usando maturin"
+            PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+            
+            # Tenta build com maturin + Android Python sysroot
+            if maturin build $MATURIN_BUILD_ARGS --out ../../dist; then
+              echo "✅ Build Rust concluído com sucesso"
+            else
+              echo "⚠️  Build Rust falhou - tentando fallback: pre-built wheel..."
+              # Fallback: baixar wheel manylinux (pode funcionar no Termux com patchelf)
+              cd ../..
+              pip download --only-binary :all: --platform manylinux_2_34_aarch64 \
+                --platform manylinux2014_aarch64 \
+                --platform linux_aarch64 \
+                -d dist \
+                "$PKG${VER:+==$VER}" 2>/dev/null || \
+              pip download --only-binary :all: -d dist "$PKG${VER:+==$VER}" 2>/dev/null || true
+              ls dist/ 2>/dev/null || echo "⚠️ Nenhuma wheel alternativa encontrada"
+            fi
+            
+          elif [ -f "pyproject.toml" ]; then
+            echo "🐍 Projeto Python moderno detectado (pyproject.toml) → usando python -m build"
+            pip install build
+            python -m build --wheel --outdir ../../dist
+            
+          elif [ -f "setup.py" ]; then
+            echo "🐍 Projeto Python legado detectado (setup.py) → usando pip wheel"
+            pip wheel . -w ../../dist --no-deps
+            
+          else
+            echo "❌ Tipo de projeto não reconhecido (sem Cargo.toml, pyproject.toml ou setup.py)"
+            exit 1
+          fi
+
+      - name: 📤 Upload Wheel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.package_name }}-android-${{ inputs.arch }}
+          path: dist/*.whl
+          if-no-files-found: warn
+          retention-days: 7
