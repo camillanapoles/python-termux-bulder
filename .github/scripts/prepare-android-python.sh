@@ -5,7 +5,7 @@ set -euo pipefail
 ARCH="${1:-aarch64}"
 ANDROID_API="${2:-24}"
 PYTHON_VERSION="${3:-3.12}"
-SYSROOT_DIR="${RUNNER_TEMP:-/tmp}/android-python-sysroot"
+SYSROOT_DIR="${SYSROOT_DIR:-${RUNNER_TEMP:-/tmp}/android-python-sysroot}"
 EXTRACT_DIR="${SYSROOT_DIR}/extracted"
 
 case "$ARCH" in
@@ -55,6 +55,20 @@ PYEOF
 echo "=== Baixando Python sysroot para $TRIPLE ==="
 mkdir -p "$SYSROOT_DIR" "$EXTRACT_DIR"
 
+# Cache hit (Layer 2): sysroot já extraído de um run anterior — reusa sem re-download.
+# Só casa um sysroot Termux real (libpython em */usr/lib/*); um stub fallback vive em $SYSROOT_DIR/lib e não dispara isto.
+FOUND_LIB=$(find "$EXTRACT_DIR" -path "*/usr/lib/libpython*.so*" -type f -print -quit 2>/dev/null || true)
+LIB_DIR=""
+[ -n "$FOUND_LIB" ] && LIB_DIR="$(dirname "$FOUND_LIB")"
+if [ -n "$LIB_DIR" ]; then
+    echo "✓ Sysroot restaurado do cache (sem re-download): $LIB_DIR"
+    echo "PYO3_CROSS_LIB_DIR=$LIB_DIR" >> "$GITHUB_ENV"
+    echo "PYO3_CROSS_PYTHON_VERSION=${PYTHON_VERSION}" >> "$GITHUB_ENV"
+    echo "MATURIN_BUILD_ARGS=--target $TRIPLE --skip-auditwheel --strip -i python${PYTHON_VERSION}" >> "$GITHUB_ENV"
+    echo "✓ Cross-compilação configurada com sysroot em cache"
+    exit 0
+fi
+
 # Tentar baixar Python do Termux
 DEB_URL="https://packages.termux.dev/apt/termux-main/pool/main/p/python/python_${PYTHON_VERSION}_${ARCH}.deb"
 if curl -sL -o "${SYSROOT_DIR}/python.deb" "$DEB_URL"; then
@@ -70,7 +84,9 @@ if curl -sL -o "${SYSROOT_DIR}/python.deb" "$DEB_URL"; then
         EXTRACT_OK=0
     fi
     if [ "${EXTRACT_OK:-0}" = "1" ]; then
-        LIB_DIR=$(find "$EXTRACT_DIR" -path "*/usr/lib/libpython*.so*" -type f -exec dirname {} \; 2>/dev/null | head -1)
+        FOUND_LIB=$(find "$EXTRACT_DIR" -path "*/usr/lib/libpython*.so*" -type f -print -quit 2>/dev/null || true)
+        LIB_DIR=""
+        [ -n "$FOUND_LIB" ] && LIB_DIR="$(dirname "$FOUND_LIB")"
         if [ -n "$LIB_DIR" ]; then
             echo "✓ libpython encontrado: $LIB_DIR"
             echo "PYO3_CROSS_LIB_DIR=$LIB_DIR" >> "$GITHUB_ENV"

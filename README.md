@@ -4,7 +4,7 @@ Uma fábrica automatizada para compilar pacotes Python com extensões Rust (usan
 
 ## 🎯 Objetivo
 
-Este repositório fornece um workflow do GitHub Actions que compila wheels Python para arquitetura `aarch64-linux-android`, permitindo a instalação de pacotes com extensões nativas no Termux.
+Este repositório fornece um workflow do GitHub Actions que compila wheels Python para Android/Termux nas arquiteturas `aarch64`, `x86_64`, `armv7l` e `i686`, permitindo a instalação de pacotes com extensões nativas no Termux.
 
 ## 🔧 Como Funciona
 
@@ -37,16 +37,26 @@ env:
 
 ### 1. Disparar o Workflow Manualmente
 
-No GitHub, vá até **Actions** → **Fábrica Universal Android** → **Run workflow**
+No GitHub, vá até **Actions** → **Android Wheel Factory** → **Run workflow**
 
 Preencha os parâmetros:
 - **package_name**: Nome do pacote PyPI (ex: `jiter`, `pydantic-core`, `orjson`)
-- **package_version**: Versão específica (ex: `0.12.0`)
+- **package_version**: Versão específica (ex: `0.12.0`) — deixe em branco para a mais recente
 - **python_version**: Versão do Python no Termux (ex: `3.12`)
+- **arch**: Arquitetura alvo — `aarch64` (padrão), `x86_64`, `armv7l`, `i686`
 
 ### 2. Baixar o Wheel Compilado
 
 Após o build bem-sucedido, o wheel estará disponível em **Artifacts**.
+Também via CLI local (`gh` autenticado):
+
+```bash
+gh workflow run android-wheel.yml -f package_name=jiter -f python_version=3.12 -f arch=aarch64
+gh run watch
+gh run download <run-id> -n jiter-android-aarch64
+```
+
+> Fluxo completo, contrato de I/O, leis da infraestrutura e estratégia de checkpoint de cache em [`SEQUENCIADOR.md`](SEQUENCIADOR.md).
 
 ### 3. Instalar no Termux
 

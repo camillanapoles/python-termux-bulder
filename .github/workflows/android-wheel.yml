@@ -29,6 +29,7 @@ jobs:
       ANDROID_API: 24
       ARCH: ${{ inputs.arch }}
       TARGET: ${{ inputs.arch == 'aarch64' && 'aarch64-linux-android' || inputs.arch == 'x86_64' && 'x86_64-linux-android' || inputs.arch == 'armv7l' && 'armv7a-linux-androideabi' || inputs.arch == 'i686' && 'i686-linux-android' || 'aarch64-linux-android' }}
+      SYSROOT_DIR: ${{ github.workspace }}/.cache/android-sysroot
 
     steps:
       - name: 📥 Checkout Repository
@@ -38,7 +39,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python_version }}
-          cache: ''
+          cache: 'pip'
+          cache-dependency-path: requirements-build.txt
 
       - name: 📱 Setup Android NDK
         uses: android-actions/setup-android@v3
@@ -51,11 +53,10 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             ~/.rustup/
-            target/
-          key: ${{ runner.os }}-rust-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: rust-${{ env.TARGET }}-py${{ inputs.python_version }}
           restore-keys: |
-            ${{ runner.os }}-rust-${{ env.TARGET }}-
-            ${{ runner.os }}-rust-
+            rust-${{ env.TARGET }}-
+            rust-
 
       - name: 🦀 Setup Rust & PyO3 Env
         run: |
@@ -103,6 +104,12 @@ jobs:
           mkdir -p fake_libs
           touch fake_libs/libpython${PYTHON_VER}.so
           echo "RUSTFLAGS=-L ${{ github.workspace }}/fake_libs -C link-arg=-Wl,--unresolved-symbols=ignore-all -C link-arg=-Wl,--allow-shlib-undefined" >> $GITHUB_ENV
+
+      - name: 📦 Cache Android Python Sysroot
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SYSROOT_DIR }}
+          key: sysroot-${{ inputs.arch }}-py${{ inputs.python_version }}
 
       - name: 🐍 Prepare Android Python Sysroot (para maturin/PyO3)
         run: |
@@ -173,5 +180,5 @@ jobs:
         with:
           name: ${{ inputs.package_name }}-android-${{ inputs.arch }}
           path: dist/*.whl
-          if-no-files-found: warn
-          retention-days: 7
+          if-no-files-found: error
+          retention-days: 30
