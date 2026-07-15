@@ -138,19 +138,27 @@ jobs:
           tar -xzf *.tar.gz
           cd $(find . -maxdepth 1 -type d | tail -n 1)
           
-          # tree-sitter grammars com sdist incompleto: buscar common/ do repo GitHub
+          # tree-sitter grammars com sdist incompleto: buscar arquivos faltantes do repo GitHub
           if echo "${{ inputs.package_name }}" | grep -qi '^tree-sitter-'; then
+            TS_PKG="${{ inputs.package_name }}"
+            TS_VER="${{ inputs.package_version }}"
+            TS_REFS="v$TS_VER $TS_VER master main"
+            # 1) common/scanner.h (+util.h) — grammars multi (typescript, php)
             if grep -rq '\.\./\.\./common/' --include='*.c' . 2>/dev/null && [ ! -s common/scanner.h ]; then
               mkdir -p common
-              for ORG in tree-sitter tree-sitter-grammars; do
-                for BR in master main; do
-                  for HF in scanner.h util.h; do
-                    [ -s "common/$HF" ] && continue
-                    content=$(curl -sfL "https://raw.githubusercontent.com/$ORG/${{ inputs.package_name }}/$BR/common/$HF" 2>/dev/null || true)
-                    [ -n "$content" ] && printf '%s' "$content" > "common/$HF"
-                  done
-                done
-              done
+              for ORG in tree-sitter tree-sitter-grammars; do for REF in $TS_REFS; do for HF in scanner.h util.h; do
+                [ -s "common/$HF" ] && continue
+                content=$(curl -sfL "https://raw.githubusercontent.com/$ORG/$TS_PKG/$REF/common/$HF" 2>/dev/null || true)
+                [ -n "$content" ] && printf '%s' "$content" > "common/$HF"
+              done; done; done
+            fi
+            # 2) src/scanner.c — grammars com external scanner cujo sdist omitiu (python)
+            if [ ! -f src/scanner.c ] && grep -rqE "external_scanner" --include='*.c' --include='*.h' . 2>/dev/null; then
+              for ORG in tree-sitter tree-sitter-grammars; do for REF in $TS_REFS; do
+                [ -f src/scanner.c ] && break
+                content=$(curl -sfL "https://raw.githubusercontent.com/$ORG/$TS_PKG/$REF/src/scanner.c" 2>/dev/null || true)
+                [ -n "$content" ] && printf '%s' "$content" > src/scanner.c
+              done; done
             fi
           fi
           
